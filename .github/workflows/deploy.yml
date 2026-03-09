@@ -1,0 +1,125 @@
+# =============================================================================
+# AWS S3 + CloudFront 배포 자동화
+# =============================================================================
+# main 브랜치에 push될 때 Next.js 정적 빌드 결과물(out/)을 S3에 업로드하고
+# CloudFront 캐시를 무효화하여 배포된 사이트가 바로 반영되도록 합니다.
+#
+# [필요한 GitHub 설정]
+# Repository → Settings → Secrets and variables → Actions
+#
+# Variables (vars):
+#   - AWS_REGION              : 리전 (예: ap-northeast-2)
+#   - S3_BUCKET_NAME          : 정적 파일을 올릴 S3 버킷 이름
+#   - CLOUDFRONT_DISTRIBUTION_ID : 캐시 무효화할 CloudFront 배포 ID
+#
+# Secrets (OIDC 사용 시):
+#   - AWS_ROLE_ARN            : 연동한 IAM 역할 ARN
+#
+# Secrets (액세스 키 사용 시):
+#   - AWS_ACCESS_KEY_ID       : IAM 사용자 액세스 키 ID
+#   - AWS_SECRET_ACCESS_KEY   : IAM 사용자 시크릿 액세스 키
+# =============================================================================
+
+name: Deploy Nakta (S3 + CloudFront)
+
+on:
+  push:
+    branches: [main]
+
+# 워크플로 재실행 시 이전 실행과 충돌하지 않도록 동시 실행 방지
+concurrency:
+  group: deploy-nakta
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build & Deploy to S3 + CloudFront
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write # OIDC로 AWS 인증 시 필요
+
+    steps:
+      # -------------------------------------------------------------------------
+      # 1. 저장소 코드 체크아웃
+      # -------------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      # -------------------------------------------------------------------------
+      # 2. Node.js 및 pnpm 환경 설정
+      # -------------------------------------------------------------------------
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: "pnpm"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      # -------------------------------------------------------------------------
+      # 3. 의존성 설치 및 정적 빌드
+      # next.config.ts의 output: "export"에 의해 out/ 디렉터리에 정적 파일 생성
+      # -------------------------------------------------------------------------
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Next.js (static export)
+        run: pnpm run build
+
+      # -------------------------------------------------------------------------
+      # 4. AWS 자격 증명 설정
+      # -------------------------------------------------------------------------
+      # 방법 A: OIDC (권장) - GitHub과 AWS IAM 역할 연동, 별도 액세스 키 불필요
+      # AWS 콘솔에서 IAM OIDC Identity Provider 등록 후 아래 주석 해제하여 사용
+      # - name: Configure AWS credentials (OIDC)
+      #   uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+      #     aws-region: ${{ vars.AWS_REGION }}
+
+      # 방법 B: 액세스 키 (GitHub Secrets에 AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY 저장)
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # -------------------------------------------------------------------------
+      # 5. S3 버킷에 빌드 결과물 동기화
+      # -------------------------------------------------------------------------
+      # out/ 내용을 S3 버킷 루트로 업로드
+      # --delete: S3에 있지만 로컬에 없는 파일(이전 배포 잔여물) 삭제
+      # --no-follow-symlinks: 심볼릭 링크를 따라가지 않음
+      - name: Sync files to S3
+        run: |
+          # JS/CSS/이미지 등: 장기 캐시 (파일명 해시로 배포 시 변경되므로)
+          aws s3 sync out/ s3://${{ vars.S3_BUCKET_NAME }}/ \
+            --delete \
+            --no-follow-symlinks \
+            --cache-control "public, max-age=31536000, immutable" \
+            --exclude "*.html" \
+            --exclude "*.json"
+          # HTML/JSON만: 짧은 캐시 (라우트·메타 변경 즉시 반영, --delete 없이 덮어쓰기만)
+          aws s3 sync out/ s3://${{ vars.S3_BUCKET_NAME }}/ \
+            --no-follow-symlinks \
+            --cache-control "public, max-age=0, must-revalidate" \
+            --exclude "*" \
+            --include "*.html" \
+            --include "*.json"
+
+      # -------------------------------------------------------------------------
+      # 6. CloudFront 캐시 무효화
+      # -------------------------------------------------------------------------
+      # 배포 직후 사용자가 이전 캐시를 보지 않도록 "/*" 경로 무효화
+      # 배포 생성 시점의 타임스탬프를 invalidation ID로 사용해 중복 무효화 방지
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ vars.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/*"
